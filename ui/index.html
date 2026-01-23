@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Poker WS Test UI</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #0f1115;
+        --panel: #171a21;
+        --text: #e6e6e6;
+        --muted: #9aa0a6;
+        --accent: #4caf50;
+        --danger: #ef5350;
+        --border: #2a2f3a;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      main {
+        max-width: 1100px;
+        margin: 24px auto;
+        padding: 0 16px 32px;
+      }
+      h1 {
+        margin: 0 0 16px;
+        font-size: 22px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1.1fr 1fr;
+        gap: 16px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      input,
+      select,
+      button {
+        background: #0b0d12;
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 10px;
+        font-size: 14px;
+      }
+      button {
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        color: #0b0d12;
+        border-color: transparent;
+        font-weight: 600;
+      }
+      button.danger {
+        background: var(--danger);
+        color: #fff;
+        border-color: transparent;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .state-line {
+        display: flex;
+        justify-content: space-between;
+        padding: 6px 0;
+        border-bottom: 1px solid var(--border);
+        font-size: 14px;
+      }
+      .state-line:last-child {
+        border-bottom: none;
+      }
+      .cards {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .card {
+        background: #10131a;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-weight: 600;
+      }
+      .log {
+        max-height: 380px;
+        overflow: auto;
+        font-size: 13px;
+        background: #0b0d12;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      @media (max-width: 900px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Poker WebSocket Test UI</h1>
+      <div class="grid">
+        <section class="panel">
+          <div class="row">
+            <div>
+              <label for="ws-url">WebSocket URL</label>
+              <input id="ws-url" style="width: 320px" />
+            </div>
+            <div>
+              <label for="session-id">Session ID</label>
+              <input id="session-id" style="width: 260px" />
+            </div>
+            <div>
+              <label for="player-id">Player ID</label>
+              <input id="player-id" style="width: 110px" />
+            </div>
+            <button id="connect-btn" class="primary">Connect</button>
+            <button id="disconnect-btn">Disconnect</button>
+          </div>
+          <div class="row" style="margin-top: 12px">
+            <button data-action="check">Check</button>
+            <button data-action="call">Call</button>
+            <button data-action="fold" class="danger">Fold</button>
+            <input id="raise-amount" type="number" min="1" placeholder="Raise to" />
+            <button data-action="raise">Raise</button>
+          </div>
+          <div class="row muted" style="margin-top: 12px">
+            Legal actions will enable/disable buttons automatically.
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="state-line">
+            <span>Street</span><span id="state-street">-</span>
+          </div>
+          <div class="state-line">
+            <span>Pot</span><span id="state-pot">-</span>
+          </div>
+          <div class="state-line">
+            <span>Current Player</span><span id="state-player">-</span>
+          </div>
+          <div class="state-line">
+            <span>Community Cards</span>
+            <span class="cards" id="state-board"></span>
+          </div>
+          <div class="state-line">
+            <span>Your Hand</span>
+            <span class="cards" id="state-hand"></span>
+          </div>
+          <div class="state-line">
+            <span>Stacks</span>
+            <span id="state-stacks">-</span>
+          </div>
+          <div class="state-line">
+            <span>Bets</span>
+            <span id="state-bets">-</span>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel" style="margin-top: 16px">
+        <div class="row" style="justify-content: space-between">
+          <strong>Event / Message Log</strong>
+          <button id="clear-log">Clear</button>
+        </div>
+        <div id="log" class="log" style="margin-top: 10px"></div>
+      </section>
+    </main>
+
+    <script>
+      const wsUrlInput = document.getElementById("ws-url");
+      const sessionIdInput = document.getElementById("session-id");
+      const playerIdInput = document.getElementById("player-id");
+      const connectBtn = document.getElementById("connect-btn");
+      const disconnectBtn = document.getElementById("disconnect-btn");
+      const logEl = document.getElementById("log");
+      const raiseInput = document.getElementById("raise-amount");
+      const actionButtons = document.querySelectorAll("button[data-action]");
+
+      const stateEls = {
+        street: document.getElementById("state-street"),
+        pot: document.getElementById("state-pot"),
+        player: document.getElementById("state-player"),
+        board: document.getElementById("state-board"),
+        hand: document.getElementById("state-hand"),
+        stacks: document.getElementById("state-stacks"),
+        bets: document.getElementById("state-bets"),
+      };
+
+      let socket = null;
+
+      function log(message) {
+        const timestamp = new Date().toLocaleTimeString();
+        logEl.textContent += `[${timestamp}] ${message}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function setCards(container, cards) {
+        container.innerHTML = "";
+        if (!cards || !cards.length) {
+          container.textContent = "-";
+          return;
+        }
+        cards.forEach((card) => {
+          const div = document.createElement("span");
+          div.className = "card";
+          div.textContent = card;
+          container.appendChild(div);
+        });
+      }
+
+      function updateState(payload) {
+        stateEls.street.textContent = payload.street || "-";
+        stateEls.pot.textContent = payload.pot ?? "-";
+        stateEls.player.textContent = payload.current_player || "-";
+        setCards(stateEls.board, payload.community_cards || []);
+        setCards(stateEls.hand, payload.player_hand || []);
+        stateEls.stacks.textContent = payload.stacks
+          ? JSON.stringify(payload.stacks)
+          : "-";
+        stateEls.bets.textContent = payload.bets ? JSON.stringify(payload.bets) : "-";
+
+        if (payload.session_id) {
+          sessionIdInput.value = payload.session_id;
+          localStorage.setItem("session_id", payload.session_id);
+        }
+
+        const legal = new Set(payload.legal_actions || []);
+        actionButtons.forEach((button) => {
+          const action = button.dataset.action;
+          button.disabled = !legal.has(action);
+        });
+      }
+
+      function connect() {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          return;
+        }
+        const baseUrl = wsUrlInput.value.trim();
+        const sessionId = sessionIdInput.value.trim();
+        const playerId = playerIdInput.value.trim();
+        const params = new URLSearchParams();
+        if (sessionId) params.set("session_id", sessionId);
+        if (playerId) params.set("player_id", playerId);
+        const url = params.toString() ? `${baseUrl}?${params.toString()}` : baseUrl;
+        socket = new WebSocket(url);
+
+        socket.onopen = () => {
+          log("Connected");
+        };
+        socket.onclose = () => {
+          log("Disconnected");
+        };
+        socket.onerror = () => {
+          log("WebSocket error");
+        };
+        socket.onmessage = (event) => {
+          let message = null;
+          try {
+            message = JSON.parse(event.data);
+          } catch (err) {
+            log(`Invalid JSON: ${event.data}`);
+            return;
+          }
+          if (message.type === "STATE") {
+            updateState(message.payload);
+            log(`STATE: ${message.payload.street}`);
+          } else if (message.type === "EVENT") {
+            log(`EVENT: ${message.payload.event} ${JSON.stringify(message.payload.data || {})}`);
+          } else if (message.type === "ERROR") {
+            log(`ERROR: ${JSON.stringify(message.payload)}`);
+          } else {
+            log(`MESSAGE: ${event.data}`);
+          }
+        };
+      }
+
+      function disconnect() {
+        if (socket) {
+          socket.close();
+          socket = null;
+        }
+      }
+
+      function sendAction(action) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          log("Not connected");
+          return;
+        }
+        const payload = { type: "MOVE", action };
+        if (action === "raise") {
+          const amount = parseInt(raiseInput.value, 10);
+          if (!Number.isFinite(amount) || amount <= 0) {
+            log("Enter a valid raise amount");
+            return;
+          }
+          payload.amount = amount;
+        }
+        socket.send(JSON.stringify(payload));
+      }
+
+      wsUrlInput.value =
+        localStorage.getItem("ws_url") || "ws://127.0.0.1:8000/ws";
+      sessionIdInput.value = localStorage.getItem("session_id") || "";
+      playerIdInput.value = localStorage.getItem("player_id") || "p1";
+
+      connectBtn.addEventListener("click", () => {
+        localStorage.setItem("ws_url", wsUrlInput.value.trim());
+        localStorage.setItem("session_id", sessionIdInput.value.trim());
+        localStorage.setItem("player_id", playerIdInput.value.trim());
+        connect();
+      });
+      disconnectBtn.addEventListener("click", () => disconnect());
+      document.getElementById("clear-log").addEventListener("click", () => {
+        logEl.textContent = "";
+      });
+      actionButtons.forEach((button) => {
+        button.addEventListener("click", () => sendAction(button.dataset.action));
+      });
+    </script>
+  </body>
+</html>

@@ -16,6 +16,15 @@ Example call:
 }
 ```
 
+Example check:
+
+```json
+{
+  "type": "MOVE",
+  "action": "check"
+}
+```
+
 Example raise:
 
 ```json
@@ -26,10 +35,18 @@ Example raise:
 }
 ```
 
+Notes on betting:
+- `amount` is interpreted as the total amount the player will have contributed
+  on the current street (i.e., "raise to").
+- Minimum raise is the size of the previous raise, with a minimum of the big
+  blind when no bet has been made this street.
+- All-in raises below the minimum are allowed but do not re-open action.
+ - Heads-up only with fixed blinds (SB=5, BB=10) and starting stacks (1000).
+
 ## Server -> Client (STATE)
 
-The server sends the full public state. The `hand` field is only included for
-the human player's own view.
+The server sends the full public state. The `player_hand` field is only included
+for the human player's own view.
 
 ```json
 {
@@ -39,7 +56,7 @@ the human player's own view.
     "street": "flop",
     "pot": 150,
     "community_cards": ["Ah", "Td", "7s"],
-    "hand": ["Kc", "Kh"],
+    "player_hand": ["Kc", "Kh"],
     "stacks": {
       "p1": 850,
       "p2": 1000
@@ -50,7 +67,7 @@ the human player's own view.
     },
     "current_player": "p2",
     "legal_actions": ["check", "raise", "fold"],
-    "action_history": [
+    "history": [
       {
         "player_id": "p1",
         "action": {
@@ -73,7 +90,39 @@ Event messages are optional and intended for UI animation timing.
   "payload": {
     "event": "DEAL_FLOP",
     "data": {
+      "street": "flop",
       "cards": ["Ah", "Td", "7s"]
+    }
+  }
+}
+```
+
+Example DEAL_HOLE (public cards only):
+
+```json
+{
+  "type": "EVENT",
+  "payload": {
+    "event": "DEAL_HOLE",
+    "data": {
+      "street": "preflop",
+      "cards": []
+    }
+  }
+}
+```
+
+Example HAND_END:
+
+```json
+{
+  "type": "EVENT",
+  "payload": {
+    "event": "HAND_END",
+    "data": {
+      "winner": "p1",
+      "hand_category": "Pair",
+      "pot": 150
     }
   }
 }

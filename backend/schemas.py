@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, ValidationError, conint, root_validator
+from pydantic import BaseModel, Field, ValidationError, conint, root_validator, validator
 
 
 class ActionType(str, Enum):
@@ -27,6 +27,8 @@ class EventType(str, Enum):
     DEAL_TURN = "DEAL_TURN"
     DEAL_RIVER = "DEAL_RIVER"
     SHOWDOWN = "SHOWDOWN"
+    HAND_END = "HAND_END"
+    NEW_HAND = "NEW_HAND"
 
 
 def _validate_action_amount(action: ActionType, amount: Optional[int]) -> None:
@@ -53,6 +55,12 @@ class ClientMessage(BaseModel):
     action: ActionType = Field(alias="val")
     amount: Optional[conint(ge=1)] = None
 
+    @validator("action", pre=True)
+    def normalize_deal_action(cls, value: Any) -> Any:
+        if isinstance(value, str) and value.lower() == "deal":
+            return ActionType.CALL
+        return value
+
     @root_validator(skip_on_failure=True)
     def validate_move(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         message_type = values.get("type")
@@ -75,12 +83,15 @@ class GameStatePublic(BaseModel):
     street: Street
     pot: conint(ge=0) = 0
     community_cards: List[str] = Field(default_factory=list)
-    hand: Optional[List[str]] = None
+    hand: Optional[List[str]] = Field(default=None, alias="player_hand")
     stacks: Dict[str, conint(ge=0)]
     bets: Dict[str, conint(ge=0)]
     current_player: Optional[str] = None
     legal_actions: List[ActionType] = Field(default_factory=list)
-    action_history: List[ActionRecord] = Field(default_factory=list)
+    action_history: List[ActionRecord] = Field(default_factory=list, alias="history")
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class ErrorMessage(BaseModel):
