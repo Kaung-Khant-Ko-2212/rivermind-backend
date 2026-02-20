@@ -90,6 +90,9 @@ class GameStatePublic(BaseModel):
     bets: Dict[str, conint(ge=0)]
     current_player: Optional[str] = None
     legal_actions: List[ActionType] = Field(default_factory=list)
+    to_call: Optional[conint(ge=0)] = None
+    min_raise_to: Optional[conint(ge=0)] = None
+    max_raise_to: Optional[conint(ge=0)] = None
     action_history: List[ActionRecord] = Field(default_factory=list, alias="history")
     hand_strength_pct: Optional[confloat(ge=0, le=100)] = None
     hand_strength_label: Optional[str] = None

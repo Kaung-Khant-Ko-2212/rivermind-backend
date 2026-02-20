@@ -319,6 +319,12 @@ class Engine:
         player_hand = self.hole_cards.get(viewer) if viewer in self.hole_cards else None
         hand_strength_label, hand_strength_pct = self._viewer_strength(viewer)
         revealed_hands = None
+        current_player = self.betting.current_player
+        to_call = self.betting.to_call(current_player) if current_player else None
+        min_raise_to = self.betting.min_raise_to() if current_player else None
+        max_raise_to = (
+            self.betting.max_raise_to(current_player) if current_player else None
+        )
         if self.street == Street.SHOWDOWN or self.betting.hand_over:
             revealed_hands = {
                 player: list(cards)
@@ -335,8 +341,11 @@ class Engine:
             revealed_hands=revealed_hands,
             stacks=dict(self.betting.stacks),
             bets=dict(self.betting.contributions),
-            current_player=self.betting.current_player,
+            current_player=current_player,
             legal_actions=list(self.betting.legal_actions()),
+            to_call=to_call,
+            min_raise_to=min_raise_to,
+            max_raise_to=max_raise_to,
             action_history=list(self.betting.action_history[-history_limit:]),
             hand_strength_label=hand_strength_label,
             hand_strength_pct=hand_strength_pct,
