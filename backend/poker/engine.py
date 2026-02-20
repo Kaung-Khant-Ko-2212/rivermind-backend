@@ -6,7 +6,7 @@ import json
 from typing import Dict, List, Optional, Tuple
 
 from .betting import BettingState
-from .cards import Deck
+from .cards import Deck, build_deck
 from .evaluator import compare_hands, evaluate_hand, hand_category
 from ..schemas import Action, EventMessage, EventType, GameStatePublic, Street
 
@@ -15,6 +15,7 @@ HUMAN_PLAYER_ID = "p1"
 AI_PLAYER_ID = "p2"
 DEFAULT_PLAYERS = ("p1", "p2", "p3", "p4", "p5")
 DEFAULT_HISTORY_LIMIT = 10
+DEFAULT_HAND_STRENGTH_ROLLOUTS = 120
 
 
 @dataclass
@@ -30,6 +31,30 @@ class Engine:
     bb_player: str = "p2"
     pending_events: List[EventMessage] = field(default_factory=list)
     _rng: random.Random = field(default_factory=random.Random, init=False)
+    _starting_stacks: Dict[str, int] = field(default_factory=dict, init=False)
+
+    def _eligible_players_for_hand(self) -> Tuple[str, ...]:
+        if not self.betting.stacks:
+            return self.players
+        return tuple(
+            player
+            for player in self.players
+            if self.betting.stacks.get(player, self.betting.starting_stack) > 0
+        )
+
+    def _next_eligible_player_from_index(
+        self,
+        eligible_players: Tuple[str, ...],
+        start_index: int,
+    ) -> Optional[str]:
+        if not eligible_players:
+            return None
+        eligible_set = set(eligible_players)
+        for offset in range(len(self.players)):
+            candidate = self.players[(start_index + offset) % len(self.players)]
+            if candidate in eligible_set:
+                return candidate
+        return None
 
     def new_hand(
         self, seed: Optional[int] = None, rotate_button: bool = False
@@ -39,23 +64,44 @@ class Engine:
         if rotate_button:
             self.button_index = (self.button_index + 1) % len(self.players)
         self.button_index = self.button_index % len(self.players)
-        self.button_player = self.players[self.button_index]
-        sb_index = self._small_blind_index()
-        bb_index = self._big_blind_index()
-        self.bb_player = self.players[bb_index]
+        hand_players = self._eligible_players_for_hand()
+        if not hand_players:
+            hand_players = self.players
+
+        button_player = self._next_eligible_player_from_index(
+            hand_players,
+            self.button_index,
+        )
+        if button_player is None:
+            button_player = hand_players[0]
+        self.button_player = button_player
+        button_hand_index = hand_players.index(button_player)
+        if len(hand_players) == 2:
+            sb_index = button_hand_index
+            bb_index = (button_hand_index + 1) % len(hand_players)
+            first_to_act = hand_players[sb_index]
+        else:
+            sb_index = (button_hand_index + 1) % len(hand_players)
+            bb_index = (button_hand_index + 2) % len(hand_players)
+            first_to_act = hand_players[(bb_index + 1) % len(hand_players)]
+        self.bb_player = hand_players[bb_index]
         self._rng = random.Random(seed)
         self.deck = Deck()
         self.deck.shuffle(self._rng)
         self.board = []
         self.street = Street.PREFLOP
-        self.hole_cards = {player: self.deck.deal(2) for player in self.players}
-        first_to_act = self._first_to_act_preflop(bb_index)
+        hand_player_set = set(hand_players)
+        self.hole_cards = {
+            player: self.deck.deal(2) if player in hand_player_set else []
+            for player in self.players
+        }
         self.betting.start_hand(
-            players=self.players,
-            sb_player=self.players[sb_index],
-            bb_player=self.players[bb_index],
+            players=hand_players,
+            sb_player=hand_players[sb_index],
+            bb_player=hand_players[bb_index],
             first_to_act=first_to_act,
         )
+        self._starting_stacks = dict(self.betting.stacks)
         self._queue_event(
             EventType.DEAL_HOLE,
             {"street": self.street.value, "cards": []},
@@ -184,6 +230,86 @@ class Engine:
     def resolve_showdown(self) -> None:
         self._resolve_showdown()
 
+    def _estimate_viewer_equity(
+        self,
+        hole_cards: List[str],
+        board_cards: List[str],
+        n_opponents: int,
+        rollouts: int = DEFAULT_HAND_STRENGTH_ROLLOUTS,
+    ) -> float:
+        if n_opponents <= 0:
+            return 1.0
+
+        known_cards = set(hole_cards + board_cards)
+        deck = [card for card in build_deck() if card not in known_cards]
+        board_cards_needed = max(0, 5 - len(board_cards))
+        draw_count = board_cards_needed + (2 * n_opponents)
+        if draw_count <= 0 or draw_count > len(deck):
+            return 0.0
+
+        total_score = 0.0
+        for _ in range(max(1, rollouts)):
+            drawn = self._rng.sample(deck, draw_count)
+            completed_board = board_cards + drawn[:board_cards_needed]
+            hero_score = evaluate_hand(hole_cards, completed_board)
+
+            contenders: List[Tuple[str, int]] = [("hero", hero_score)]
+            opp_start = board_cards_needed
+            for i in range(n_opponents):
+                opp_hole = drawn[opp_start + (i * 2): opp_start + ((i + 1) * 2)]
+                contenders.append((f"opp{i}", evaluate_hand(opp_hole, completed_board)))
+
+            best_score = min(score for _, score in contenders)
+            winners = [player for player, score in contenders if score == best_score]
+            if "hero" in winners:
+                total_score += 1.0 / len(winners)
+
+        return total_score / max(1, rollouts)
+
+    def _viewer_strength(self, viewer: Optional[str]) -> Tuple[Optional[str], Optional[float]]:
+        if not viewer:
+            return None, None
+        hole_cards = self.hole_cards.get(viewer) or []
+        if len(hole_cards) != 2:
+            return None, None
+
+        board_cards = list(self.board)
+        if len(board_cards) >= 3:
+            try:
+                score = evaluate_hand(hole_cards, board_cards)
+                label = hand_category(score)
+            except Exception:
+                label = "Hand"
+        else:
+            same_rank = hole_cards[0][0] == hole_cards[1][0]
+            suited = hole_cards[0][1] == hole_cards[1][1]
+            if same_rank:
+                label = "Pocket Pair"
+            elif suited:
+                label = "Suited"
+            else:
+                label = "High Card"
+
+        active_opponents = [
+            player
+            for player in self.betting.active_players()
+            if player != viewer
+        ]
+        n_opponents = len(active_opponents)
+        if n_opponents <= 0:
+            return label, 100.0
+
+        try:
+            equity = self._estimate_viewer_equity(
+                hole_cards=hole_cards,
+                board_cards=board_cards,
+                n_opponents=n_opponents,
+            )
+        except Exception:
+            return label, None
+
+        return label, round(equity * 100, 1)
+
     def to_public_state(
         self,
         viewer: Optional[str] = HUMAN_PLAYER_ID,
@@ -191,6 +317,14 @@ class Engine:
         session_id: Optional[str] = None,
     ) -> Dict[str, object]:
         player_hand = self.hole_cards.get(viewer) if viewer in self.hole_cards else None
+        hand_strength_label, hand_strength_pct = self._viewer_strength(viewer)
+        revealed_hands = None
+        if self.street == Street.SHOWDOWN or self.betting.hand_over:
+            revealed_hands = {
+                player: list(cards)
+                for player, cards in self.hole_cards.items()
+                if len(cards) == 2
+            }
 
         state = GameStatePublic(
             session_id=session_id,
@@ -198,11 +332,14 @@ class Engine:
             pot=self.betting.pot,
             community_cards=list(self.board),
             hand=player_hand,
+            revealed_hands=revealed_hands,
             stacks=dict(self.betting.stacks),
             bets=dict(self.betting.contributions),
             current_player=self.betting.current_player,
             legal_actions=list(self.betting.legal_actions()),
             action_history=list(self.betting.action_history[-history_limit:]),
+            hand_strength_label=hand_strength_label,
+            hand_strength_pct=hand_strength_pct,
         )
 
         return json.loads(state.json(by_alias=True, exclude_none=True))
@@ -218,6 +355,11 @@ class Engine:
             "stacks": dict(self.betting.stacks),
             "bets": dict(self.betting.contributions),
             "current_player": current_player,
+            "big_blind": self.betting.big_blind,
+            "pot": self.betting.pot,
+            "community_cards": list(self.board),
+            "hand": list(self.hole_cards.get(current_player, [])),
+            "action_history": list(self.betting.action_history),
         }
 
     def _first_ai_player(self) -> str:
@@ -242,12 +384,78 @@ class Engine:
         return self.players[(bb_index + 1) % len(self.players)]
 
     def _first_to_act_postflop(self) -> str:
-        start_index = self._small_blind_index()
-        for offset in range(len(self.players)):
-            candidate = self.players[(start_index + offset) % len(self.players)]
+        players_in_hand = self.betting.players or self.players
+        if not players_in_hand:
+            return self.button_player
+
+        if self.button_player in players_in_hand:
+            start_index = (players_in_hand.index(self.button_player) + 1) % len(players_in_hand)
+        else:
+            start_index = 0
+
+        for offset in range(len(players_in_hand)):
+            candidate = players_in_hand[(start_index + offset) % len(players_in_hand)]
             if candidate in self.betting.folded_players:
                 continue
             if candidate in self.betting.all_in_players:
                 continue
             return candidate
-        return self.players[start_index]
+        return players_in_hand[start_index]
+
+    def clone(self) -> "Engine":
+        import copy
+
+        return copy.deepcopy(self)
+
+    def is_terminal(self) -> bool:
+        return self.street == Street.SHOWDOWN or self.betting.hand_over
+
+    def utility(self, player_id: str) -> int:
+        current_stack = self.betting.stacks.get(player_id, 0)
+        starting_stack = self._starting_stacks.get(player_id, self.betting.starting_stack)
+        return current_stack - starting_stack
+
+    def get_chip_change(self, player_id: str) -> int:
+        return self.utility(player_id)
+
+    def load_hand(self, hand: Dict[str, object]) -> None:
+        self.deck = Deck()
+        self.board = list(hand.get("board", []))
+        self.hole_cards = dict(hand.get("hole_cards", {}))
+
+        for player in self.players:
+            self.hole_cards.setdefault(player, [])
+
+        street_str = str(hand.get("street", Street.PREFLOP.value))
+        try:
+            self.street = Street(street_str)
+        except ValueError:
+            self.street = Street.PREFLOP
+
+        stacks = dict(hand.get("stacks", {}))
+        for player in self.players:
+            stacks.setdefault(player, self.betting.starting_stack)
+        self.betting.stacks = stacks
+        self._starting_stacks = dict(stacks)
+
+        self.betting.pot = int(hand.get("pot", 0))
+        self.betting.contributions = dict(hand.get("bets", {}))
+        for player in self.players:
+            self.betting.contributions.setdefault(player, 0)
+
+        raw_history = hand.get("action_history", [])
+        if isinstance(raw_history, list):
+            self.betting.action_history = raw_history
+        else:
+            self.betting.action_history = []
+
+        raw_current = hand.get("current_player")
+        if isinstance(raw_current, str) and raw_current in self.players:
+            self.betting.current_player = raw_current
+        else:
+            self.betting.current_player = self._first_to_act_preflop(self._big_blind_index())
+
+        self.betting.hand_over = bool(hand.get("hand_over", False))
+        self.betting.folded_players = set(hand.get("folded_players", []))
+        self.betting.all_in_players = set(hand.get("all_in_players", []))
+        self.betting.pending_players = set(hand.get("pending_players", []))

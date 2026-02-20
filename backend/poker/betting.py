@@ -40,22 +40,44 @@ class BettingState:
         first_to_act: str,
     ) -> None:
         self.players = players
-        self.stacks = {player: self.starting_stack for player in self.players}
-        self.contributions = {player: 0 for player in self.players}
+        if not self.stacks:
+            self.stacks = {player: self.starting_stack for player in self.players}
+        else:
+            self.stacks = {
+                player: max(0, int(chips))
+                for player, chips in self.stacks.items()
+            }
+            for player in self.players:
+                self.stacks.setdefault(player, self.starting_stack)
+
+        self.contributions = {player: 0 for player in self.stacks}
         self.pot = 0
         self.current_bet = 0
         self.last_raise_size = self.big_blind
-        self.pending_players = set(self.players)
+        self.pending_players = set()
         self.action_history = []
         self.hand_over = False
         self.winner = None
         self.folded_players = set()
         self.all_in_players = set()
 
+        if len(self.players) < 2:
+            self.hand_over = True
+            self.winner = self.players[0] if self.players else None
+            self.current_player = None
+            return
+
         self._post_blind(sb_player, self.small_blind)
         self._post_blind(bb_player, self.big_blind)
-        self.current_bet = self.big_blind
+        self.current_bet = max(
+            (self.contributions[player] for player in self.players),
+            default=0,
+        )
+        self.all_in_players = {player for player in self.players if self.stacks[player] == 0}
+        self.pending_players = set(self.active_players()) - set(self.all_in_players)
         self.current_player = first_to_act
+        if self.current_player in self.all_in_players:
+            self.current_player = self._next_player(self.current_player)
 
     def start_new_round(self, first_to_act: str) -> None:
         self.contributions = {player: 0 for player in self.players}
@@ -117,7 +139,7 @@ class BettingState:
                 )
             round_complete = self._round_complete()
 
-        if action.action == ActionType.CHECK:
+        elif action.action == ActionType.CHECK:
             if to_call != 0:
                 raise ValueError("Cannot check when facing a bet")
             self._record_action(player_id, action)

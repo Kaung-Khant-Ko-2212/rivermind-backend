@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, ValidationError, conint, root_validator, validator
+from pydantic import BaseModel, Field, ValidationError, confloat, conint, root_validator, validator
 
 
 class ActionType(str, Enum):
@@ -29,6 +29,7 @@ class EventType(str, Enum):
     SHOWDOWN = "SHOWDOWN"
     HAND_END = "HAND_END"
     NEW_HAND = "NEW_HAND"
+    TABLE_END = "TABLE_END"
 
 
 def _validate_action_amount(action: ActionType, amount: Optional[int]) -> None:
@@ -84,17 +85,21 @@ class GameStatePublic(BaseModel):
     pot: conint(ge=0) = 0
     community_cards: List[str] = Field(default_factory=list)
     hand: Optional[List[str]] = Field(default=None, alias="player_hand")
+    revealed_hands: Optional[Dict[str, List[str]]] = None
     stacks: Dict[str, conint(ge=0)]
     bets: Dict[str, conint(ge=0)]
     current_player: Optional[str] = None
     legal_actions: List[ActionType] = Field(default_factory=list)
     action_history: List[ActionRecord] = Field(default_factory=list, alias="history")
+    hand_strength_pct: Optional[confloat(ge=0, le=100)] = None
+    hand_strength_label: Optional[str] = None
 
     class Config:
         allow_population_by_field_name = True
 
 
 class ErrorMessage(BaseModel):
+    code: Optional[str] = None
     message: str
     details: Optional[List[str]] = None
 
@@ -135,4 +140,4 @@ def format_validation_error(error: ValidationError) -> ErrorMessage:
             details.append(f"{location}: {message}")
         else:
             details.append(message)
-    return ErrorMessage(message="Invalid message", details=details or None)
+    return ErrorMessage(code="VALIDATION_ERROR", message="Invalid message", details=details or None)

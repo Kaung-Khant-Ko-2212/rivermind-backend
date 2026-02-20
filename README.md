@@ -6,6 +6,22 @@
 uvicorn backend.main:app --reload
 ```
 
+You can configure backend runtime values using `.env` at the backend project root
+(`Member 1 + Member 2 + Member 4/.env`). See `.env.example`.
+
+To use Member 3 strategy policy from shell:
+
+```bash
+set AI_MODE=strategy
+uvicorn backend.main:app --reload
+```
+
+Optional strategy file override:
+
+```bash
+set AI_STRATEGY_PATH=backend/ai/strategy.json
+```
+
 ## Manual WebSocket test
 
 Using a WebSocket client such as `websocat`:
@@ -40,16 +56,45 @@ The initial `STATE` message includes a `session_id`. Persist this on the client
 (for example, using `localStorage`) and reconnect with
 `ws://127.0.0.1:8000/ws?session_id=...` to resume the same game state.
 
-## Multi-human seats (minimal)
+## Multiplayer table flow
 
-The server supports up to 5 seats. To connect as a specific player, pass
-`player_id`:
+Use REST endpoints to create/join/start the table, then connect WebSocket in
+`mode=multi`.
+
+1. Create table (host gets seat `p1`):
+
+```bash
+curl -X POST http://127.0.0.1:8000/tables/create ^
+  -H "Content-Type: application/json" ^
+  -d "{\"user_key\":\"host-user\"}"
+```
+
+2. Join table (returns assigned seat):
+
+```bash
+curl -X POST http://127.0.0.1:8000/tables/TBL-XXXXXXX/join ^
+  -H "Content-Type: application/json" ^
+  -d "{\"user_key\":\"joiner-user\"}"
+```
+
+3. Start table (host only):
+
+```bash
+curl -X POST http://127.0.0.1:8000/tables/TBL-XXXXXXX/start ^
+  -H "Content-Type: application/json" ^
+  -d "{\"player_id\":\"p1\"}"
+```
+
+4. Connect seat via WebSocket:
 
 ```
-ws://127.0.0.1:8000/ws?session_id=...&player_id=p2
+ws://127.0.0.1:8000/ws?mode=multi&session_id=TBL-XXXXXXX&player_id=p2
 ```
 
-If a seat has no connected human, the AI will act for that seat.
+Notes:
+- Server supports seats `p1`..`p5`.
+- Seats without a joined human are AI-controlled.
+- Late join after table start is supported; newly joined seats can take over AI.
 
 ## Team responsibilities (file map)
 
@@ -67,3 +112,8 @@ Member 4: Infrastructure & Bridge Lead
 - `backend/config.py` (feature flags + buffer config)
 - `backend/ai/policy.py` (AI action hook for WS loop)
 - `backend/protocol.md` (message/event contract)
+
+Member 3: CFR Scientist (integrated)
+- `backend/ai/strategy.json` (exported strategy table used at runtime)
+- `backend/ai/training_dataset.jsonl` (training dataset)
+- `backend/ai/trainingdata.py` (MCCFR trainer/export script)

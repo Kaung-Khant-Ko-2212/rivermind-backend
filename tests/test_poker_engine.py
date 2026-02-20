@@ -76,3 +76,29 @@ def test_public_state_matches_schema_and_hides_ai_cards() -> None:
     parsed_ai = GameStatePublic.parse_obj(ai_view)
     assert parsed_ai.hand is None
     assert "player_hand" not in ai_view
+
+
+def test_busted_player_not_dealt_next_hand() -> None:
+    engine = Engine(players=(HUMAN_PLAYER_ID, "p2", "p3"))
+    engine.new_hand(seed=11)
+    engine.betting.stacks = {HUMAN_PLAYER_ID: 0, "p2": 1000, "p3": 1000}
+
+    engine.start_next_hand(seed=12)
+
+    assert engine.hole_cards[HUMAN_PLAYER_ID] == []
+    assert HUMAN_PLAYER_ID not in engine.betting.players
+    assert set(engine.betting.players) == {"p2", "p3"}
+    assert HUMAN_PLAYER_ID not in engine.betting.active_players()
+
+
+def test_single_remaining_player_ends_hand_without_readding_busted_seat() -> None:
+    engine = Engine(players=(HUMAN_PLAYER_ID, "p2"))
+    engine.new_hand(seed=13)
+    engine.betting.stacks = {HUMAN_PLAYER_ID: 1000, "p2": 0}
+
+    engine.start_next_hand(seed=14)
+
+    assert engine.betting.players == (HUMAN_PLAYER_ID,)
+    assert engine.betting.hand_over is True
+    assert engine.betting.current_player is None
+    assert engine.hole_cards["p2"] == []

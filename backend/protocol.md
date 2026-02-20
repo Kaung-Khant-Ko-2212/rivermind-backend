@@ -1,13 +1,35 @@
 # Texas Hold'em WebSocket Protocol
 
-This document describes the minimal JSON contracts used between client and server.
+This document defines the canonical JSON contract used by the React client and
+FastAPI backend.
 
-## Client -> Server (MOVE)
+## Connection
 
-Actions are sent as a single `MOVE` message. The `amount` field is only valid for
-`raise`.
+WebSocket endpoint:
 
-Example call:
+```
+ws://127.0.0.1:8000/ws?mode=<single|multi>&session_id=<optional>&player_id=<optional>
+```
+
+- `mode`: defaults to `single`. Use `multi` for multiplayer tables.
+- `session_id`: reuse previous game state on reconnect.
+- `player_id`: seat identity (`p1`..`p5`). Defaults to `p1`.
+
+### Multiplayer table setup (required before `mode=multi`)
+
+1. `POST /tables/create` -> returns `table_id` and host seat `p1`.
+2. `POST /tables/{table_id}/join` -> returns assigned seat (`p2`..`p5`).
+3. `POST /tables/{table_id}/start` -> host starts the table.
+4. Connect websocket with `mode=multi`, `session_id=<table_id>`, `player_id=<seat>`.
+
+If a socket connects with `mode=multi` but seat/table preconditions are not met,
+server sends `ERROR` and closes the socket.
+
+## Client -> Server
+
+### MOVE
+
+Canonical payload:
 
 ```json
 {
@@ -16,16 +38,7 @@ Example call:
 }
 ```
 
-Example check:
-
-```json
-{
-  "type": "MOVE",
-  "action": "check"
-}
-```
-
-Example raise:
+Raise example:
 
 ```json
 {
@@ -35,18 +48,20 @@ Example raise:
 }
 ```
 
-Notes on betting:
-- `amount` is interpreted as the total amount the player will have contributed
-  on the current street (i.e., "raise to").
-- Minimum raise is the size of the previous raise, with a minimum of the big
-  blind when no bet has been made this street.
-- All-in raises below the minimum are allowed but do not re-open action.
- - Heads-up only with fixed blinds (SB=5, BB=10) and starting stacks (1000).
+Compatibility note:
+- Backend currently accepts `val` as an alias for `action`:
+  `{ "type": "MOVE", "val": "call" }`.
+- New clients should always send `action`.
 
-## Server -> Client (STATE)
+Validation rules:
+- `type` must be `MOVE`.
+- `action` must be one of: `check`, `call`, `fold`, `raise`.
+- `amount` is required only for `raise`.
+- `amount` is interpreted as **raise-to total** for this betting round.
 
-The server sends the full public state. The `player_hand` field is only included
-for the human player's own view.
+## Server -> Client
+
+### STATE
 
 ```json
 {
@@ -80,9 +95,11 @@ for the human player's own view.
 }
 ```
 
-## Server -> Client (EVENT)
+Field notes:
+- `player_hand` is only present for the viewer seat.
+- `history` is the recent action sequence (bounded on backend).
 
-Event messages are optional and intended for UI animation timing.
+### EVENT
 
 ```json
 {
@@ -97,49 +114,27 @@ Event messages are optional and intended for UI animation timing.
 }
 ```
 
-Example DEAL_HOLE (public cards only):
+Known event names:
+- `DEAL_HOLE`
+- `DEAL_FLOP`
+- `DEAL_TURN`
+- `DEAL_RIVER`
+- `SHOWDOWN`
+- `HAND_END`
+- `NEW_HAND`
+- `TABLE_END` (multiplayer table complete; no further moves accepted)
 
-```json
-{
-  "type": "EVENT",
-  "payload": {
-    "event": "DEAL_HOLE",
-    "data": {
-      "street": "preflop",
-      "cards": []
-    }
-  }
-}
-```
-
-Example HAND_END:
-
-```json
-{
-  "type": "EVENT",
-  "payload": {
-    "event": "HAND_END",
-    "data": {
-      "winner": "p1",
-      "hand_category": "Pair",
-      "pot": 150
-    }
-  }
-}
-```
-
-## Server -> Client (ERROR)
-
-Validation errors should be returned as human-readable messages.
+### ERROR
 
 ```json
 {
   "type": "ERROR",
   "payload": {
+    "code": "VALIDATION_ERROR",
     "message": "Invalid message",
-    "details": [
-      "amount: amount is required for raise"
-    ]
+    "details": ["amount: amount is required for raise"]
   }
 }
 ```
+
+`code` is optional but recommended for client-side handling.
