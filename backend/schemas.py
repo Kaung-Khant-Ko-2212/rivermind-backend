@@ -86,8 +86,12 @@ class GameStatePublic(BaseModel):
     community_cards: List[str] = Field(default_factory=list)
     hand: Optional[List[str]] = Field(default=None, alias="player_hand")
     revealed_hands: Optional[Dict[str, List[str]]] = None
+    folded_players: List[str] = Field(default_factory=list)
     stacks: Dict[str, conint(ge=0)]
     bets: Dict[str, conint(ge=0)]
+    button_player: Optional[str] = None
+    small_blind_player: Optional[str] = None
+    big_blind_player: Optional[str] = None
     current_player: Optional[str] = None
     legal_actions: List[ActionType] = Field(default_factory=list)
     to_call: Optional[conint(ge=0)] = None
@@ -96,6 +100,8 @@ class GameStatePublic(BaseModel):
     action_history: List[ActionRecord] = Field(default_factory=list, alias="history")
     hand_strength_pct: Optional[confloat(ge=0, le=100)] = None
     hand_strength_label: Optional[str] = None
+    hand_category_probs: Optional[Dict[str, confloat(ge=0, le=100)]] = None
+    awaiting_hand_continue: bool = False
 
     class Config:
         allow_population_by_field_name = True

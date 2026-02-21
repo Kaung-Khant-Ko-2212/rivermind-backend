@@ -16,6 +16,17 @@ AI_PLAYER_ID = "p2"
 DEFAULT_PLAYERS = ("p1", "p2", "p3", "p4", "p5")
 DEFAULT_HISTORY_LIMIT = 10
 DEFAULT_HAND_STRENGTH_ROLLOUTS = 120
+HAND_CATEGORY_ORDER = (
+    "Straight Flush",
+    "Four of a Kind",
+    "Full House",
+    "Flush",
+    "Straight",
+    "Three of a Kind",
+    "Two Pair",
+    "Pair",
+    "High Card",
+)
 
 
 @dataclass
@@ -28,6 +39,7 @@ class Engine:
     players: Tuple[str, ...] = field(default_factory=lambda: DEFAULT_PLAYERS)
     button_index: int = 0
     button_player: str = HUMAN_PLAYER_ID
+    sb_player: str = HUMAN_PLAYER_ID
     bb_player: str = "p2"
     pending_events: List[EventMessage] = field(default_factory=list)
     _rng: random.Random = field(default_factory=random.Random, init=False)
@@ -84,6 +96,7 @@ class Engine:
             sb_index = (button_hand_index + 1) % len(hand_players)
             bb_index = (button_hand_index + 2) % len(hand_players)
             first_to_act = hand_players[(bb_index + 1) % len(hand_players)]
+        self.sb_player = hand_players[sb_index]
         self.bb_player = hand_players[bb_index]
         self._rng = random.Random(seed)
         self.deck = Deck()
@@ -230,32 +243,40 @@ class Engine:
     def resolve_showdown(self) -> None:
         self._resolve_showdown()
 
-    def _estimate_viewer_equity(
+    def _estimate_viewer_outcomes(
         self,
         hole_cards: List[str],
         board_cards: List[str],
         n_opponents: int,
         rollouts: int = DEFAULT_HAND_STRENGTH_ROLLOUTS,
-    ) -> float:
-        if n_opponents <= 0:
-            return 1.0
+    ) -> Tuple[float, Dict[str, float]]:
+        opponent_count = max(0, n_opponents)
+        safe_rollouts = max(1, rollouts)
 
         known_cards = set(hole_cards + board_cards)
         deck = [card for card in build_deck() if card not in known_cards]
         board_cards_needed = max(0, 5 - len(board_cards))
-        draw_count = board_cards_needed + (2 * n_opponents)
-        if draw_count <= 0 or draw_count > len(deck):
-            return 0.0
+        draw_count = board_cards_needed + (2 * opponent_count)
+        default_probs = {category: 0.0 for category in HAND_CATEGORY_ORDER}
+        if draw_count < 0 or draw_count > len(deck):
+            return 0.0, default_probs
 
         total_score = 0.0
-        for _ in range(max(1, rollouts)):
+        category_counts: Dict[str, int] = {category: 0 for category in HAND_CATEGORY_ORDER}
+        for _ in range(safe_rollouts):
             drawn = self._rng.sample(deck, draw_count)
             completed_board = board_cards + drawn[:board_cards_needed]
             hero_score = evaluate_hand(hole_cards, completed_board)
+            hero_category = hand_category(hero_score)
+            category_counts[hero_category] = category_counts.get(hero_category, 0) + 1
+
+            if opponent_count <= 0:
+                total_score += 1.0
+                continue
 
             contenders: List[Tuple[str, int]] = [("hero", hero_score)]
             opp_start = board_cards_needed
-            for i in range(n_opponents):
+            for i in range(opponent_count):
                 opp_hole = drawn[opp_start + (i * 2): opp_start + ((i + 1) * 2)]
                 contenders.append((f"opp{i}", evaluate_hand(opp_hole, completed_board)))
 
@@ -264,14 +285,35 @@ class Engine:
             if "hero" in winners:
                 total_score += 1.0 / len(winners)
 
-        return total_score / max(1, rollouts)
+        category_probs = {
+            category: (count * 100.0) / safe_rollouts
+            for category, count in category_counts.items()
+        }
+        return total_score / safe_rollouts, category_probs
 
-    def _viewer_strength(self, viewer: Optional[str]) -> Tuple[Optional[str], Optional[float]]:
+    def _estimate_viewer_equity(
+        self,
+        hole_cards: List[str],
+        board_cards: List[str],
+        n_opponents: int,
+        rollouts: int = DEFAULT_HAND_STRENGTH_ROLLOUTS,
+    ) -> float:
+        equity, _ = self._estimate_viewer_outcomes(
+            hole_cards=hole_cards,
+            board_cards=board_cards,
+            n_opponents=n_opponents,
+            rollouts=rollouts,
+        )
+        return equity
+
+    def _viewer_strength(
+        self, viewer: Optional[str]
+    ) -> Tuple[Optional[str], Optional[float], Optional[Dict[str, float]]]:
         if not viewer:
-            return None, None
+            return None, None, None
         hole_cards = self.hole_cards.get(viewer) or []
         if len(hole_cards) != 2:
-            return None, None
+            return None, None, None
 
         board_cards = list(self.board)
         if len(board_cards) >= 3:
@@ -295,20 +337,22 @@ class Engine:
             for player in self.betting.active_players()
             if player != viewer
         ]
-        n_opponents = len(active_opponents)
-        if n_opponents <= 0:
-            return label, 100.0
+        n_opponents = max(0, len(active_opponents))
 
         try:
-            equity = self._estimate_viewer_equity(
+            equity, category_probs = self._estimate_viewer_outcomes(
                 hole_cards=hole_cards,
                 board_cards=board_cards,
                 n_opponents=n_opponents,
             )
         except Exception:
-            return label, None
+            return label, None, None
 
-        return label, round(equity * 100, 1)
+        rounded_probs = {
+            category: round(prob, 1)
+            for category, prob in category_probs.items()
+        }
+        return label, round(equity * 100, 1), rounded_probs
 
     def to_public_state(
         self,
@@ -317,7 +361,9 @@ class Engine:
         session_id: Optional[str] = None,
     ) -> Dict[str, object]:
         player_hand = self.hole_cards.get(viewer) if viewer in self.hole_cards else None
-        hand_strength_label, hand_strength_pct = self._viewer_strength(viewer)
+        hand_strength_label, hand_strength_pct, hand_category_probs = self._viewer_strength(
+            viewer
+        )
         revealed_hands = None
         current_player = self.betting.current_player
         to_call = self.betting.to_call(current_player) if current_player else None
@@ -339,8 +385,12 @@ class Engine:
             community_cards=list(self.board),
             hand=player_hand,
             revealed_hands=revealed_hands,
+            folded_players=sorted(self.betting.folded_players),
             stacks=dict(self.betting.stacks),
             bets=dict(self.betting.contributions),
+            button_player=self.button_player,
+            small_blind_player=self.sb_player,
+            big_blind_player=self.bb_player,
             current_player=current_player,
             legal_actions=list(self.betting.legal_actions()),
             to_call=to_call,
@@ -349,6 +399,7 @@ class Engine:
             action_history=list(self.betting.action_history[-history_limit:]),
             hand_strength_label=hand_strength_label,
             hand_strength_pct=hand_strength_pct,
+            hand_category_probs=hand_category_probs,
         )
 
         return json.loads(state.json(by_alias=True, exclude_none=True))

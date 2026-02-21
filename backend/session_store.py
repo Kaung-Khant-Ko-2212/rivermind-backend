@@ -25,6 +25,7 @@ class SessionData:
     created_at: float = field(default_factory=time.time)
     table_ended: bool = False
     table_winners: List[str] = field(default_factory=list)
+    awaiting_hand_continue: bool = False
 
 
 class SessionStore:

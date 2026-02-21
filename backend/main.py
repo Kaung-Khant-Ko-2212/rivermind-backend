@@ -45,7 +45,6 @@ replay_buffer: Optional[ReplayBuffer] = (
 )
 TRACE_ENABLED = config.game_trace
 TURN_DELAY_SECONDS = config.ai_turn_delay_ms / 1000.0
-HAND_END_PAUSE_SECONDS = config.hand_end_pause_ms / 1000.0
 
 
 class CreateTableRequest(BaseModel):
@@ -182,6 +181,19 @@ def _parse_json_payload(raw_text: str) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Message must be a JSON object")
     return payload
+
+
+async def _advance_to_next_hand(session) -> None:
+    session.awaiting_hand_continue = False
+    session.engine.start_next_hand()
+    _trace(
+        session.session_id,
+        f"NEXT_HAND_STARTED button={session.engine.button_player} current={session.engine.betting.current_player}",
+    )
+    await _broadcast_new_hand(session)
+    events = session.engine.drain_events()
+    await _broadcast_events(session, events)
+    await _broadcast_state(session)
 
 
 @app.websocket("/ws")
@@ -363,6 +375,51 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
                 continue
 
+            message_type = str(payload.get("type") or "").strip().upper()
+            if message_type == "CONTINUE":
+                if session.mode == "multi" and session.table_ended:
+                    await send_server_message(
+                        websocket,
+                        ServerMessage(
+                            type="ERROR",
+                            payload=ErrorMessage(
+                                code="TABLE_ENDED",
+                                message="This table has ended",
+                                details=["Create a new table to continue playing"],
+                            ),
+                        ),
+                    )
+                    continue
+                if not session.engine.betting.hand_over:
+                    await send_server_message(
+                        websocket,
+                        ServerMessage(
+                            type="ERROR",
+                            payload=ErrorMessage(
+                                code="HAND_NOT_OVER",
+                                message="Cannot continue yet",
+                                details=["The current hand is still in progress"],
+                            ),
+                        ),
+                    )
+                    continue
+                if not session.awaiting_hand_continue:
+                    await send_server_message(
+                        websocket,
+                        ServerMessage(
+                            type="ERROR",
+                            payload=ErrorMessage(
+                                code="HAND_CONTINUE_NOT_READY",
+                                message="Hand is not waiting for continue",
+                            ),
+                        ),
+                    )
+                    continue
+                _trace(session.session_id, f"HAND_CONTINUE by={player_id}")
+                await _advance_to_next_hand(session)
+                await _run_ai_turns(session, replay_buffer)
+                continue
+
             try:
                 client_message = ClientMessage.parse_obj(payload)
             except ValidationError as exc:
@@ -454,18 +511,30 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 
 async def _broadcast_update(session) -> None:
+    funded_players = []
+    table_should_end = False
+    if session.engine.betting.hand_over:
+        funded_players = [
+            player_id
+            for player_id, chips in session.engine.betting.stacks.items()
+            if chips > 0
+        ]
+        table_should_end = session.mode == "multi" and len(funded_players) <= 1
+        if not table_should_end and not session.awaiting_hand_continue:
+            session.awaiting_hand_continue = True
+            _trace(
+                session.session_id,
+                "HAND_WAITING_FOR_CONTINUE",
+            )
+
     events = session.engine.drain_events()
     await _broadcast_events(session, events)
     await _broadcast_state(session)
 
     if session.engine.betting.hand_over:
         _audit_chips(session)
-        funded_players = [
-            player_id
-            for player_id, chips in session.engine.betting.stacks.items()
-            if chips > 0
-        ]
-        if session.mode == "multi" and len(funded_players) <= 1:
+        if table_should_end:
+            session.awaiting_hand_continue = False
             if not session.table_ended:
                 session.table_ended = True
                 session.table_winners = list(funded_players)
@@ -484,17 +553,7 @@ async def _broadcast_update(session) -> None:
                 await _broadcast_events(session, [end_event])
             await _broadcast_state(session)
             return
-        if HAND_END_PAUSE_SECONDS > 0:
-            _trace(
-                session.session_id,
-                f"HAND_END_PAUSE ms={int(HAND_END_PAUSE_SECONDS * 1000)}",
-            )
-            await asyncio.sleep(HAND_END_PAUSE_SECONDS)
-        session.engine.start_next_hand()
-        await _broadcast_new_hand(session)
-        events = session.engine.drain_events()
-        await _broadcast_events(session, events)
-        await _broadcast_state(session)
+        return
 
 
 async def _broadcast_events(session, events) -> None:
@@ -525,6 +584,9 @@ async def _broadcast_new_hand(session) -> None:
             data={
                 "player_hand": session.engine.hole_cards.get(player_id, []),
                 "button": session.engine.button_player,
+                "small_blind_player": session.engine.sb_player,
+                "big_blind_player": session.engine.bb_player,
+                "current_player": session.engine.betting.current_player,
             },
         )
         delivered = await _safe_send(socket, ServerMessage(type="EVENT", payload=new_hand_event))
@@ -539,10 +601,12 @@ async def _broadcast_state(session) -> None:
         f"STATE street={session.engine.street.value} pot={session.engine.betting.pot} current={session.engine.betting.current_player} legal={[a.value for a in session.engine.betting.legal_actions()]}",
     )
     for player_id, socket in list(session.player_sockets.items()):
+        state_payload = session.engine.to_public_state(
+            viewer=player_id, session_id=session.session_id
+        )
+        state_payload["awaiting_hand_continue"] = bool(session.awaiting_hand_continue)
         updated_state = GameStatePublic.parse_obj(
-            session.engine.to_public_state(
-                viewer=player_id, session_id=session.session_id
-            )
+            state_payload
         )
         delivered = await _safe_send(socket, ServerMessage(type="STATE", payload=updated_state))
         if not delivered:
