@@ -586,6 +586,8 @@ async def _broadcast_new_hand(session) -> None:
                 "button": session.engine.button_player,
                 "small_blind_player": session.engine.sb_player,
                 "big_blind_player": session.engine.bb_player,
+                "small_blind": session.engine.betting.small_blind,
+                "big_blind": session.engine.betting.big_blind,
                 "current_player": session.engine.betting.current_player,
             },
         )
