@@ -2,6 +2,7 @@ import json
 import logging
 import time
 import asyncio
+import random
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -45,6 +46,9 @@ replay_buffer: Optional[ReplayBuffer] = (
 )
 TRACE_ENABLED = config.game_trace
 TURN_DELAY_SECONDS = config.ai_turn_delay_ms / 1000.0
+# Frontend hand intro sequence currently shows Dealer -> (2s) -> SB -> (2s) -> BB
+# and then waits another 2s before actions resume.
+HAND_INTRO_BLOCK_SECONDS = 6.0
 
 
 class CreateTableRequest(BaseModel):
@@ -75,6 +79,29 @@ async def _sleep_between_turns(session_id: str, reason: str) -> None:
     await asyncio.sleep(TURN_DELAY_SECONDS)
 
 
+def _start_hand_intro_block(session) -> None:
+    session.hand_intro_block_until = time.time() + max(0.0, HAND_INTRO_BLOCK_SECONDS)
+    _trace(
+        session.session_id,
+        f"HAND_INTRO_BLOCK start until={round(session.hand_intro_block_until, 3)} secs={HAND_INTRO_BLOCK_SECONDS}",
+    )
+
+
+def _hand_intro_wait_remaining(session) -> float:
+    return max(0.0, float(getattr(session, "hand_intro_block_until", 0.0) or 0.0) - time.time())
+
+
+async def _wait_for_hand_intro_if_needed(session) -> None:
+    remaining = _hand_intro_wait_remaining(session)
+    if remaining <= 0:
+        return
+    _trace(
+        session.session_id,
+        f"HAND_INTRO_WAIT ms={int(remaining * 1000)}",
+    )
+    await asyncio.sleep(remaining)
+
+
 def _audit_chips(session) -> None:
     stacks = session.engine.betting.stacks
     total_chips = sum(stacks.values())
@@ -96,6 +123,343 @@ def _audit_chips(session) -> None:
         session.session_id,
         f"CHIP_AUDIT_OK total={total_chips} stacks={stacks}",
     )
+
+
+def _ensure_tendency_row(session, player_id: str) -> Dict[str, int]:
+    stats = session.player_tendency_stats.get(player_id)
+    if stats is None:
+        stats = {
+            "actions": 0,
+            "folds": 0,
+            "checks": 0,
+            "calls": 0,
+            "raises": 0,
+            "preflop_actions": 0,
+            "preflop_vpip_opportunities": 0,
+            "preflop_vpip": 0,
+            "facing_bet_samples": 0,
+            "fold_vs_bet": 0,
+            "call_vs_bet": 0,
+            "raise_vs_bet": 0,
+        }
+        session.player_tendency_stats[player_id] = stats
+    return stats
+
+
+def _record_human_tendency(
+    session,
+    *,
+    player_id: str,
+    action: Action,
+    street: str,
+    to_call_before: int,
+    legal_actions_before: list[ActionType],
+) -> None:
+    stats = _ensure_tendency_row(session, player_id)
+    action_name = action.action.value
+
+    stats["actions"] += 1
+    if action_name == "fold":
+        stats["folds"] += 1
+    elif action_name == "check":
+        stats["checks"] += 1
+    elif action_name == "call":
+        stats["calls"] += 1
+    elif action_name == "raise":
+        stats["raises"] += 1
+
+    if street == "preflop":
+        stats["preflop_actions"] += 1
+        # VPIP opportunity approximated as having a voluntary decision preflop.
+        # Excludes free checks in BB when to_call == 0.
+        if to_call_before > 0 or ActionType.RAISE in legal_actions_before:
+            stats["preflop_vpip_opportunities"] += 1
+            if action.action in {ActionType.CALL, ActionType.RAISE}:
+                stats["preflop_vpip"] += 1
+
+    if to_call_before > 0:
+        stats["facing_bet_samples"] += 1
+        if action.action == ActionType.FOLD:
+            stats["fold_vs_bet"] += 1
+        elif action.action == ActionType.CALL:
+            stats["call_vs_bet"] += 1
+        elif action.action == ActionType.RAISE:
+            stats["raise_vs_bet"] += 1
+
+
+def _build_opponent_profile(session, ai_player: str) -> Optional[Dict[str, Any]]:
+    relevant_rows: list[Dict[str, int]] = []
+    for player_id, stats in session.player_tendency_stats.items():
+        if player_id == ai_player:
+            continue
+        if not isinstance(stats, dict):
+            continue
+        relevant_rows.append(stats)
+
+    if not relevant_rows:
+        return None
+
+    totals: Dict[str, int] = {}
+    for row in relevant_rows:
+        for key, value in row.items():
+            totals[key] = totals.get(key, 0) + int(value or 0)
+
+    actions = max(0, totals.get("actions", 0))
+    facing_bet = max(0, totals.get("facing_bet_samples", 0))
+    preflop_vpip_opp = max(0, totals.get("preflop_vpip_opportunities", 0))
+
+    def safe_rate(num: int, den: int) -> float:
+        return float(num) / float(den) if den > 0 else 0.0
+
+    calls = totals.get("calls", 0)
+    raises = totals.get("raises", 0)
+    checks = totals.get("checks", 0)
+    folds = totals.get("folds", 0)
+    continue_vs_bet = totals.get("call_vs_bet", 0) + totals.get("raise_vs_bet", 0)
+
+    profile = {
+        "tracked_players": len(relevant_rows),
+        "samples": actions,
+        "facing_bet_samples": facing_bet,
+        "fold_rate": safe_rate(folds, actions),
+        "check_rate": safe_rate(checks, actions),
+        "call_rate": safe_rate(calls, actions),
+        "raise_rate": safe_rate(raises, actions),
+        "aggression_rate": safe_rate(raises, max(1, calls + checks)),
+        "fold_vs_bet_rate": safe_rate(totals.get("fold_vs_bet", 0), facing_bet),
+        "continue_vs_bet_rate": safe_rate(continue_vs_bet, facing_bet),
+        "raise_vs_bet_rate": safe_rate(totals.get("raise_vs_bet", 0), facing_bet),
+        "vpip_samples": preflop_vpip_opp,
+        "vpip_rate": safe_rate(totals.get("preflop_vpip", 0), preflop_vpip_opp),
+    }
+    return profile if profile["samples"] > 0 else None
+
+
+def _raise_size_candidates(engine, player_id: str) -> list[int]:
+    min_raise_to = engine.betting.min_raise_to()
+    max_raise_to = engine.betting.max_raise_to(player_id)
+    if max_raise_to < min_raise_to:
+        return [max_raise_to]
+    if max_raise_to == min_raise_to:
+        return [min_raise_to]
+
+    contribution = int(engine.betting.contributions.get(player_id, 0) or 0)
+    to_call = int(engine.betting.to_call(player_id) or 0)
+    pot = int(engine.betting.pot or 0)
+
+    raw_targets = [
+        min_raise_to,
+        contribution + to_call + max(1, pot // 2),
+        contribution + to_call + max(1, pot),
+        max_raise_to,
+    ]
+    targets: list[int] = []
+    seen: set[int] = set()
+    for target in raw_targets:
+        clamped = max(min_raise_to, min(max_raise_to, int(target)))
+        if clamped in seen:
+            continue
+        seen.add(clamped)
+        targets.append(clamped)
+    return targets or [min_raise_to]
+
+
+def _should_use_lookahead(engine, ai_player: str) -> bool:
+    legal = engine.betting.legal_actions()
+    if len(legal) <= 1:
+        return False
+    active_players = engine.betting.active_players()
+    if len(active_players) > 2:
+        return False
+    big_blind = max(1, int(engine.betting.big_blind or 10))
+    pot = max(0, int(engine.betting.pot or 0))
+    to_call = max(0, int(engine.betting.to_call(ai_player) or 0))
+    stack = max(0, int(engine.betting.stacks.get(ai_player, 0) or 0))
+    if ActionType.RAISE not in legal and to_call == 0:
+        return False
+    return (
+        pot >= 8 * big_blind
+        or to_call >= 4 * big_blind
+        or (to_call > 0 and to_call * 2 >= max(1, pot))
+        or stack <= 20 * big_blind
+    )
+
+
+def _simulate_hand_to_terminal(
+    engine,
+    *,
+    target_player: str,
+    rng: random.Random,
+    target_opponent_profile: Optional[Dict[str, Any]],
+    max_actions: int = 120,
+) -> float:
+    def _find_next_eligible_player_local() -> Optional[str]:
+        betting = engine.betting
+        current = betting.current_player
+
+        if current and current not in betting.folded_players and current not in betting.all_in_players:
+            return current
+
+        if current:
+            try:
+                candidate = betting._next_player(current)  # type: ignore[attr-defined]
+            except Exception:
+                candidate = None
+            if candidate:
+                return candidate
+
+        for player in engine.players:
+            if player in betting.pending_players and player not in betting.folded_players and player not in betting.all_in_players:
+                return player
+        return None
+
+    def _advance_without_actor_local() -> bool:
+        next_player = _find_next_eligible_player_local()
+        if next_player:
+            if engine.betting.current_player != next_player:
+                engine.betting.current_player = next_player
+                return True
+            return False
+
+        street = engine.engine.street.value if hasattr(engine, "engine") else engine.street.value
+        # engine is a poker Engine, not session; the hasattr check is defensive.
+        if street == "preflop":
+            engine.deal_flop()
+            engine.betting.start_new_round(first_to_act=engine._first_to_act_postflop())  # type: ignore[attr-defined]
+            return True
+        if street == "flop":
+            engine.deal_turn()
+            engine.betting.start_new_round(first_to_act=engine._first_to_act_postflop())  # type: ignore[attr-defined]
+            return True
+        if street == "turn":
+            engine.deal_river()
+            engine.betting.start_new_round(first_to_act=engine._first_to_act_postflop())  # type: ignore[attr-defined]
+            return True
+        if street == "river":
+            engine.resolve_showdown()
+            return True
+        return False
+
+    actions_taken = 0
+    while not engine.betting.hand_over and actions_taken < max_actions:
+        if _advance_without_actor_local():
+            continue
+        actor = engine.betting.current_player
+        if not actor:
+            break
+
+        sim_state = engine.to_ai_state()
+        if target_opponent_profile and actor == target_player:
+            sim_state["opponent_profile"] = target_opponent_profile
+        sim_action = get_ai_action(sim_state, rng=rng)
+        try:
+            engine.step(sim_action, player_id=actor)
+        except ValueError:
+            # Fallback to a safe legal action inside rollout.
+            legal = engine.betting.legal_actions()
+            fallback = None
+            for candidate in (ActionType.CHECK, ActionType.CALL, ActionType.FOLD, ActionType.RAISE):
+                if candidate in legal:
+                    if candidate == ActionType.RAISE:
+                        fallback = Action(action=ActionType.RAISE, amount=engine.betting.min_raise_to())
+                    else:
+                        fallback = Action(action=candidate)
+                    break
+            if fallback is None:
+                break
+            try:
+                engine.step(fallback, player_id=actor)
+            except ValueError:
+                break
+        actions_taken += 1
+
+    return float(engine.get_chip_change(target_player))
+
+
+def _choose_ai_action_with_lookahead(
+    session,
+    *,
+    ai_player: str,
+    base_state: Dict[str, Any],
+    opponent_profile: Optional[Dict[str, Any]],
+) -> Action:
+    base_action = get_ai_action(base_state)
+    if not _should_use_lookahead(session.engine, ai_player):
+        return base_action
+
+    legal = session.engine.betting.legal_actions()
+    candidates: list[Action] = []
+    seen_keys: set[tuple[str, Optional[int]]] = set()
+
+    def add_candidate(action: Action) -> None:
+        key = (action.action.value, int(action.amount) if action.amount is not None else None)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        candidates.append(action)
+
+    add_candidate(base_action)
+
+    for action_type in legal:
+        if action_type != ActionType.RAISE:
+            add_candidate(Action(action=action_type))
+            continue
+        for amount in _raise_size_candidates(session.engine, ai_player):
+            add_candidate(Action(action=ActionType.RAISE, amount=amount))
+
+    if len(candidates) <= 1:
+        return base_action
+
+    rollout_count = 3
+    best_action = base_action
+    best_score = float("-inf")
+    base_score = float("-inf")
+    seed_base = int(time.time() * 1000) & 0x7FFFFFFF
+
+    for idx, candidate in enumerate(candidates):
+        scores: list[float] = []
+        for rollout_idx in range(rollout_count):
+            sim_engine = session.engine.clone()
+            try:
+                sim_engine.step(candidate, player_id=ai_player)
+            except ValueError:
+                continue
+            rollout_rng = random.Random(seed_base + idx * 97 + rollout_idx * 997)
+            score = _simulate_hand_to_terminal(
+                sim_engine,
+                target_player=ai_player,
+                rng=rollout_rng,
+                target_opponent_profile=opponent_profile,
+            )
+            scores.append(score)
+        if not scores:
+            continue
+        avg_score = sum(scores) / len(scores)
+        if candidate.action == base_action.action and candidate.amount == base_action.amount:
+            base_score = avg_score
+        if avg_score > best_score:
+            best_score = avg_score
+            best_action = candidate
+
+    # Require a small edge to override the base policy to reduce rollout noise.
+    bb = max(1, int(session.engine.betting.big_blind or 10))
+    if best_action.action == base_action.action and best_action.amount == base_action.amount:
+        return base_action
+    if base_score != float("-inf") and best_score < base_score + (0.25 * bb):
+        return base_action
+
+    _trace(
+        session.session_id,
+        (
+            "AI_LOOKAHEAD_OVERRIDE "
+            f"player={ai_player} "
+            f"base={base_action.action.value}:{base_action.amount} "
+            f"chosen={best_action.action.value}:{best_action.amount} "
+            f"base_score={round(base_score, 2) if base_score != float('-inf') else 'na'} "
+            f"best_score={round(best_score, 2)}"
+        ),
+    )
+    return best_action
 
 
 @app.get("/health")
@@ -186,6 +550,7 @@ def _parse_json_payload(raw_text: str) -> Dict[str, Any]:
 async def _advance_to_next_hand(session) -> None:
     session.awaiting_hand_continue = False
     session.engine.start_next_hand()
+    _start_hand_intro_block(session)
     _trace(
         session.session_id,
         f"NEXT_HAND_STARTED button={session.engine.button_player} current={session.engine.betting.current_player}",
@@ -449,12 +814,28 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     ),
                 )
                 continue
+            intro_wait_remaining = _hand_intro_wait_remaining(session)
+            if intro_wait_remaining > 0:
+                await send_server_message(
+                    websocket,
+                    ServerMessage(
+                        type="ERROR",
+                        payload=ErrorMessage(
+                            code="HAND_INTRO_IN_PROGRESS",
+                            message="Hand intro sequence in progress",
+                            details=[f"wait_ms={int(intro_wait_remaining * 1000)}"],
+                        ),
+                    ),
+                )
+                continue
             _trace(
                 session.session_id,
                 f"HUMAN_MOVE player={acting_player} action={action.action.value} amount={action.amount} street={session.engine.street.value}",
             )
+            action_street = session.engine.street.value
+            to_call_before = session.engine.betting.to_call(acting_player)
+            legal_actions_before = list(session.engine.betting.legal_actions())
             try:
-                action_street = session.engine.street.value
                 session.engine.step(action, player_id=acting_player)
                 hand_ended_from_move = session.engine.betting.hand_over
             except ValueError as exc:
@@ -474,6 +855,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     f"HUMAN_MOVE_REJECTED player={acting_player} action={action.action.value} amount={action.amount} error={exc}",
                 )
                 continue
+            _record_human_tendency(
+                session,
+                player_id=acting_player,
+                action=action,
+                street=action_street,
+                to_call_before=to_call_before,
+                legal_actions_before=legal_actions_before,
+            )
 
             _record_experience(
                 replay_buffer, session.session_id, acting_player, action, action_street, session.engine
@@ -636,6 +1025,7 @@ async def _safe_send(websocket: WebSocket, message: ServerMessage) -> bool:
 async def _run_ai_turns(session, buffer: Optional[ReplayBuffer]) -> None:
     if session.mode == "multi" and session.table_ended:
         return
+    await _wait_for_hand_intro_if_needed(session)
 
     def _fallback_ai_action(engine) -> Optional[Action]:
         legal = engine.betting.legal_actions()
@@ -726,10 +1116,18 @@ async def _run_ai_turns(session, buffer: Optional[ReplayBuffer]) -> None:
         if session.engine.betting.current_player in human_controlled_players:
             break
 
-        ai_state = session.engine.to_ai_state()
         ai_player = session.engine.betting.current_player
+        ai_state = session.engine.to_ai_state()
+        opponent_profile = _build_opponent_profile(session, ai_player)
+        if opponent_profile:
+            ai_state["opponent_profile"] = opponent_profile
         try:
-            ai_action = get_ai_action(ai_state)
+            ai_action = _choose_ai_action_with_lookahead(
+                session,
+                ai_player=ai_player,
+                base_state=ai_state,
+                opponent_profile=opponent_profile,
+            )
         except Exception as exc:
             logger.warning(
                 "AI action generation failed session_id=%s player=%s error=%s",
@@ -850,6 +1248,11 @@ def _record_experience(
         pot=pot,
         player_stack=player_stack,
         big_blind=big_blind,
+        bets=dict(engine.betting.contributions),
+        to_call=engine.betting.to_call(player_id),
+        button_player=engine.button_player,
+        active_players=list(engine.betting.players),
+        schema_version="v2",
     )
     
     buffer.add(

@@ -26,6 +26,8 @@ class SessionData:
     table_ended: bool = False
     table_winners: List[str] = field(default_factory=list)
     awaiting_hand_continue: bool = False
+    player_tendency_stats: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    hand_intro_block_until: float = 0.0
 
 
 class SessionStore:
